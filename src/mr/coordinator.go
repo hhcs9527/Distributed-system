@@ -8,7 +8,6 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
-	"time"
 )
 
 type Coordinator struct {
@@ -33,8 +32,8 @@ func popFromQueue(files *[]string, args *WorkerArgs) bool {
 	if len(*files) > 0 {
 		file := (*files)[len(*files)-1]
 		*files = (*files)[:len(*files)-1]
-		args.file = file
-		fmt.Printf("I read, id : %v, file: %v", args.PID, args.file)
+		args.File = file
+		fmt.Printf("I read, id : %v, file: %v\n", args.Pid, args.File)
 		return true
 	}
 	return false
@@ -99,36 +98,24 @@ func (c *Coordinator) DecidePhase(args *WorkerArgs) int {
 	return phase
 }
 
-func (c *Coordinator) DispatchJob(args *WorkerArgs, reply *CoordinatorReply) error {
-	// Counter for the map / reduce function
-	mpf := make(chan bool)
-	rdf := make(chan bool)
-	ticker := time.After(5 * time.Second)
-
+func (c *Coordinator) DispatchTask(args *WorkerArgs, reply *CoordinatorReply) error {
 	// Variables for phase change
-	mapPhase, intermediatePhase, reducePhase, idle := 0, 1, 2, 3
+	intermediatePhase, reducePhase := 1, 2
 	running, complete := 2, 4
 
 	reply.Y = args.X
+	// fmt.Printf("[Coordinator] Before decide phase : %v, reply.Done: %v, with pid : %v\n", args.Phase, args, args.Pid)
+
+	args.File = ""
 	reply.Done = false
 
-	args.file = ""
-
 	c.mu.Lock()
-	args.phase = c.DecidePhase(args)
-	fmt.Printf("call func 4 %v\n", args.mapf)
+	args.Phase = c.DecidePhase(args)
+	fmt.Printf("[Coordinatorc] Current phase : %v, reply.Done: %v, with pid : %v\n", args.Phase, args.X, args.Pid)
 	c.mu.Unlock()
 
-	switch phase := args.phase; phase {
-	case mapPhase:
-		fmt.Printf("call func 5 %v\n", args.mapf)
-		go func() {
-
-			fmt.Printf("run map, pid : %v\n", args.PID)
-			mpf <- ExecMap(args, reply)
-		}()
-	case intermediatePhase:
-		fmt.Printf("coord is run intermediate, pid : %v\n", args.PID)
+	if args.Phase == intermediatePhase {
+		fmt.Printf("coord is run intermediate, pid : %v\n", args.Pid)
 		c.SetIntermediateStatus(running)
 		c.RunIntermediatePhase(1)
 		c.SetIntermediateStatus(complete)
@@ -137,42 +124,88 @@ func (c *Coordinator) DispatchJob(args *WorkerArgs, reply *CoordinatorReply) err
 		g := []string{"Japan", "Australia", "Germany"}
 		c.groups = &g
 		c.rScheduluer = Scheduluer{&g, reducePhase, 0, len(g)}
-		return nil
-	case reducePhase:
-		go func() {
-			fmt.Println("run reduce")
-			rdf <- ExecReduce(args, reply)
-		}()
-	case idle:
-		fmt.Printf("idle the worker, pid : %v\n\n\n", args.PID)
-		time.Sleep(time.Second * time.Duration(5))
-		return nil
 	}
 
-	for {
-		select {
-		case <-mpf: // Work in time.
-			fmt.Printf("Nicly done Map, id : %v, file: %v\n", args.PID, args.file)
+	// switch phase := args.Phase; phase {
+	// case mapPhase:
+	// 	fmt.Printf("call func 5 %v\n", args.mapf)
+	// 	go func() {
+
+	// 		fmt.Printf("run map, pid : %v\n", args.Pid)
+	// 		mpf <- ExecMap(args, reply)
+	// 	}()
+	// case intermediatePhase:
+	// 	fmt.Printf("coord is run intermediate, pid : %v\n", args.Pid)
+	// 	c.SetIntermediateStatus(running)
+	// 	c.RunIntermediatePhase(1)
+	// 	c.SetIntermediateStatus(complete)
+
+	// 	// Get the data for the reduce phase
+	// 	g := []string{"Japan", "Australia", "Germany"}
+	// 	c.groups = &g
+	// 	c.rScheduluer = Scheduluer{&g, reducePhase, 0, len(g)}
+	// 	return nil
+	// case reducePhase:
+	// 	go func() {
+	// 		fmt.Println("run reduce")
+	// 		rdf <- ExecReduce(args, reply)
+	// 	}()
+	// case idle:
+	// 	fmt.Printf("idle the worker, pid : %v\n\n\n", args.Pid)
+	// 	time.Sleep(time.Second * time.Duration(5))
+	// 	return nil
+	// }
+
+	// for {
+	// 	select {
+	// 	case <-mpf: // Work in time.
+	// 		fmt.Printf("Nicly done Map, id : %v, file: %v\n", args.Pid, args.File)
+	// 		c.IncreaseSchedulerTaskCnt(&c.mScheduluer)
+	// 		fmt.Printf("Nicly done, id : %v, file: %v, cnt : %v\n\n\n", args.Pid, args.File, c.mScheduluer.taskCnt)
+	// 		return nil
+
+	// 	case <-rdf: // Work in time.
+	// 		fmt.Printf("Nicly done Reduce, id : %v, file: %v\n", args.Pid, args.File)
+	// 		c.IncreaseSchedulerTaskCnt(&c.rScheduluer)
+	// 		fmt.Printf("Nicly done, id : %v, file: %v, cnt : %v\n\n\n", args.Pid, args.File, c.rScheduluer.taskCnt)
+	// 		return nil
+
+	// 	case <-ticker:
+	// 		fmt.Printf("Not done, baddddddd, id : %v, file: %v\n\n\n", args.Pid, args.File)
+	// 		if args.Phase == mapPhase {
+	// 			c.pushToQueue(c.files, args.File)
+	// 		} else if args.Phase == reducePhase {
+	// 			c.pushToQueue(c.groups, args.File)
+	// 		}
+	// 		return nil
+	// 	}
+	// }
+	return nil
+}
+
+func (c *Coordinator) ReceiveTaskExecResult(args *WorkerArgs, reply *CoordinatorReply) error {
+	fmt.Printf("[Coordinator] ReportTaskExecResult with phase : %v, args: %v, with pid : %v\n", args.Phase, args, args.Pid)
+	mapPhase, reducePhase := 0, 2
+	if args.Done {
+		if args.Phase == mapPhase {
 			c.IncreaseSchedulerTaskCnt(&c.mScheduluer)
-			fmt.Printf("Nicly done, id : %v, file: %v, cnt : %v\n\n\n", args.PID, args.file, c.mScheduluer.taskCnt)
-			return nil
-
-		case <-rdf: // Work in time.
-			fmt.Printf("Nicly done Reduce, id : %v, file: %v\n", args.PID, args.file)
+			fmt.Printf("Nicly done, id : %v, file: %v, cnt : %v\n\n\n", args.Pid, args.File, c.mScheduluer.taskCnt)
+		} else if args.Phase == reducePhase {
 			c.IncreaseSchedulerTaskCnt(&c.rScheduluer)
-			fmt.Printf("Nicly done, id : %v, file: %v, cnt : %v\n\n\n", args.PID, args.file, c.rScheduluer.taskCnt)
-			return nil
-
-		case <-ticker:
-			fmt.Printf("Not done, baddddddd, id : %v, file: %v\n\n\n", args.PID, args.file)
-			if args.phase == mapPhase {
-				c.pushToQueue(c.files, args.file)
-			} else if args.phase == reducePhase {
-				c.pushToQueue(c.groups, args.file)
-			}
-			return nil
+			fmt.Printf("Nicly done, id : %v, file: %v, cnt : %v\n\n\n", args.Pid, args.File, c.rScheduluer.taskCnt)
+		}
+	} else {
+		if args.Phase == mapPhase {
+			c.pushToQueue(c.files, args.File)
+			fmt.Printf("Not done map, baddddddd, id : %v, file: %v\n\n\n", args.Pid, args.File)
+		} else if args.Phase == reducePhase {
+			c.pushToQueue(c.groups, args.File)
+			fmt.Printf("Not done reduce, baddddddd, id : %v, file: %v\n\n\n", args.Pid, args.File)
 		}
 	}
+	// success => counter ++
+	// else => push back to other
+	return nil
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -192,9 +225,6 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	// ret := false
-
-	// Your code here.
 	return false
 }
 

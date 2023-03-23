@@ -9,7 +9,7 @@ type Scheduluer struct {
 }
 
 func (s *Scheduluer) CompleteTaskDispatch(args *WorkerArgs) bool {
-	return len(*s.queue) == 0 && args.file == ""
+	return len(*s.queue) == 0 && args.File == ""
 }
 
 func (s *Scheduluer) CompleteTask() bool {

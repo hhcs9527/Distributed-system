@@ -12,16 +12,29 @@ import (
 )
 
 type WorkerArgs struct {
-	Phase int
-	X     int
-	Pid   int
-	File  string
-	Done  bool
+	Phase        int
+	X            int
+	Pid          int
+	File         string
+	Done         bool
+	TempFile     string
+	TempFilePair KeyValue
+	Worker       *TaskWorker
 }
 
 type CoordinatorReply struct {
-	Y    int
-	Done bool
+	Y        int
+	Phase    int
+	Done     bool
+	File     string
+	FilePair KeyValue
+	RObj     ReduceObj
+}
+
+type ReduceObj struct {
+	nth   int
+	Key   string
+	Value []string
 }
 
 // Add your RPC definitions here.

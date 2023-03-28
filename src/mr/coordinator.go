@@ -1,14 +1,16 @@
 package mr
 
 import (
-	"fmt"
+	"encoding/json"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // for sorting by key.
@@ -19,130 +21,139 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
+var mapPhase = 0
+var intermediatePhase = 1
+var reducePhase = 2
+var idle = 3
+var taskCrashTime = time.Duration(12)
+var taskIdleTime = time.Duration(2)
+var taskExecTime = time.Duration(10)
+
 type Coordinator struct {
-	groups                  []string
 	tmpFiles                []string
-	mapFilePairs            []KeyValue
-	reduceObjPairs          []ReduceObj
-	mapFilePairsInProcess   []KeyValue
-	reduceObjPairsInProcess []ReduceObj
+	mapFilePairsKeys        []string
+	reduceObjPairsKeys      []string
+	mapFilePairsMap         map[string]KeyValue
+	reduceObjPairsMap       map[string]ReduceObj
+	finishMapFilePairsMap   map[string]KeyValue
+	finishReduceObjPairsMap map[string]ReduceObj
 	phase                   int // 0 => map, 1 => intermediate, 2 => reduce
 	mu                      sync.Mutex
 	intermediateStatus      int // Describe intermediate with bit 1 => not run, 2 => running , 4 => done
 	mScheduluer             Scheduluer
 	rScheduluer             Scheduluer
-}
-
-func (c *Coordinator) Example(args *WorkerArgs, reply *CoordinatorReply) error {
-	reply.Y = args.X + 1
-	return nil
+	mapCh                   chan KeyValue
+	reduceCh                chan ReduceObj
 }
 
 func (c *Coordinator) InitScheduler(phase int) {
 	c.mu.Lock()
 	mapPhase := 0
 	if phase == mapPhase {
-		// fmt.Printf("c.mapFilePairs : %v \n\n", c.mapFilePairs)
 		c.mScheduluer.phase = phase
 		c.mScheduluer.taskCnt = 0
-		c.mScheduluer.queue = &c.mapFilePairs
-		c.mScheduluer.totalTaskCnt = len(c.mapFilePairs)
+		c.mScheduluer.queue = &c.mapFilePairsMap
+		c.mScheduluer.totalTaskCnt = len(c.mapFilePairsMap)
 	} else {
 		c.rScheduluer.phase = phase
 		c.rScheduluer.taskCnt = 0
-		c.rScheduluer.reduceQueue = &c.reduceObjPairs
-		c.rScheduluer.totalTaskCnt = len(c.reduceObjPairs)
+		c.rScheduluer.reduceQueue = &c.reduceObjPairsMap
+		c.rScheduluer.totalTaskCnt = len(c.reduceObjPairsMap)
 	}
 	c.mu.Unlock()
 }
 
-func (c *Coordinator) MakeFilePairs(files []string) []KeyValue {
-	var filePairs []KeyValue
+func (c *Coordinator) MakeFilePairs(files []string) {
 	for i, file := range files {
-		filePairs = append(filePairs, KeyValue{strconv.Itoa(i), file})
+		c.mapFilePairsKeys = append(c.mapFilePairsKeys, strconv.Itoa(i))
+		c.mapFilePairsMap[strconv.Itoa(i)] = KeyValue{strconv.Itoa(i), file}
 	}
-	return filePairs
 }
 
-// control the list of files name to read/write for map and reduce
-func popFromReduceQueue(ReduceObjs *[]ReduceObj, reply *CoordinatorReply) bool {
-	reply.RObj = ReduceObj{}
-	if len(*ReduceObjs) > 0 {
-		robj := (*ReduceObjs)[len(*ReduceObjs)-1]
-		*ReduceObjs = (*ReduceObjs)[:len(*ReduceObjs)-1]
-		reply.RObj = robj
-		// // fmt.Printf("I read, file : %v", reply.File)
-		return true
-	}
-	return false
-}
-
-func popFromQueue(filePairs *[]KeyValue, reply *CoordinatorReply) bool {
+func (c *Coordinator) popFromQueue(reply *CoordinatorReply) bool {
 	reply.FilePair = KeyValue{}
-	if len(*filePairs) > 0 {
-		filePair := (*filePairs)[len(*filePairs)-1]
-		*filePairs = (*filePairs)[:len(*filePairs)-1]
+	if len(c.mapFilePairsMap) > 0 && len(c.mapFilePairsKeys) > 0 {
+		filePair := c.mapFilePairsMap[c.mapFilePairsKeys[0]]
+		delete(c.mapFilePairsMap, c.mapFilePairsKeys[0])
+		c.mapFilePairsKeys = c.mapFilePairsKeys[1:]
 		reply.FilePair = filePair
-		// // fmt.Printf("I read, file pair : %v", reply.FilePair)
+		reply.Phase = mapPhase
+		c.mapCh <- filePair
 		return true
 	}
 	return false
 }
 
-func (c *Coordinator) pushToReduceQueue(ReduceObjs *[]ReduceObj, RObj ReduceObj) {
-	c.mu.Lock()
-	*ReduceObjs = append(*ReduceObjs, RObj)
-	c.mu.Unlock()
+func (c *Coordinator) popFromReduceQueue(reply *CoordinatorReply) bool {
+	reply.RObj = ReduceObj{}
+	if len(c.reduceObjPairsMap) > 0 && len(c.reduceObjPairsKeys) > 0 {
+		robj := c.reduceObjPairsMap[c.reduceObjPairsKeys[0]]
+		delete(c.reduceObjPairsMap, c.reduceObjPairsKeys[0])
+		c.reduceObjPairsKeys = c.reduceObjPairsKeys[1:]
+		reply.RObj = robj
+		reply.Phase = reducePhase
+		c.reduceCh <- robj
+		return true
+	}
+	return false
 }
 
-func (c *Coordinator) pushToQueue(filePairs *[]KeyValue, filePair KeyValue) {
-	c.mu.Lock()
-	*filePairs = append(*filePairs, filePair)
-	c.mu.Unlock()
+func (c *Coordinator) pushToReduceQueue(RObj ReduceObj, isFinish bool) {
+	if isFinish {
+		c.finishReduceObjPairsMap[RObj.Key] = RObj
+	} else {
+		c.reduceObjPairsMap[RObj.Key] = RObj
+	}
 }
 
-// func (c *Coordinator) RunIntermediatePhase() {
-// 	// // fmt.Printf("\n\nRunIntermediatePhase...\n\n")
-// 	intermediate := []KeyValue{}
-// 	for _, filename := range c.tmpFiles {
-// 		file, err := os.Open(filename)
-// 		if err != nil {
-// 			log.Fatalf("cannot open %v", filename)
-// 		}
-// 		dec := json.NewDecoder(file)
-// 		for {
-// 			var kv KeyValue
-// 			if err := dec.Decode(&kv); err != nil {
-// 				break
-// 			}
-// 			intermediate = append(intermediate, kv)
-// 		}
-// 		file.Close()
-// 	}
+func (c *Coordinator) pushToQueue(filePair KeyValue, isFinish bool) {
+	if isFinish {
+		c.finishMapFilePairsMap[filePair.Key] = filePair
+	} else {
+		c.mapFilePairsMap[filePair.Key] = filePair
+	}
+}
 
-// 	// sort
-// 	sort.Sort(ByKey(intermediate))
+func (c *Coordinator) RunIntermediatePhase() {
+	intermediate := []KeyValue{}
+	for _, filename := range c.tmpFiles {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
 
-// 	i := 0
-// 	count := 0
-// 	for i < len(intermediate) {
-// 		j := i + 1
-// 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-// 			j++
-// 		}
+	// sort
+	sort.Sort(ByKey(intermediate))
 
-// 		values := []string{}
-// 		key := ""
-// 		for k := i; k < j; k++ {
-// 			values = append(values, intermediate[k].Value)
-// 			key = intermediate[k].Key
-// 		}
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
 
-// 		c.reduceObjPairs = append(c.reduceObjPairs, ReduceObj{count, key, values})
-// 		i = j
-// 		count++
-// 	}
-// }
+		values := []string{}
+		key := ""
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+			key = intermediate[k].Key
+		}
+
+		c.reduceObjPairsMap[key] = ReduceObj{key, values}
+		c.reduceObjPairsKeys = append(c.reduceObjPairsKeys, key)
+		i = j
+	}
+}
 
 func (c *Coordinator) CompleteIntermediate() bool {
 	return (c.intermediateStatus & 4) == 4
@@ -152,33 +163,29 @@ func (c *Coordinator) RunningIntermediate() bool {
 	return (c.intermediateStatus & 2) == 2
 }
 
-// func (c *Coordinator) SetIntermediateStatus(status int) {
-// 	c.mu.Lock()
-// 	c.intermediateStatus = status
-// 	c.mu.Unlock()
-// }
-
-func (c *Coordinator) IncreaseSchedulerTaskCnt(s *Scheduluer, args *WorkerArgs) {
-	mapPhase := 0
+func (c *Coordinator) SetIntermediateStatus(status int) {
 	c.mu.Lock()
-	s.taskCnt++
-	if s.phase == mapPhase {
-		c.tmpFiles = append(c.tmpFiles, args.TempFile)
-	}
+	c.intermediateStatus = status
 	c.mu.Unlock()
 }
 
+func (c *Coordinator) IncreaseSchedulerTaskCnt(s *Scheduluer, args *WorkerArgs, reply *CoordinatorReply) {
+	s.taskCnt++
+	if s.phase == mapPhase {
+		c.tmpFiles = append(c.tmpFiles, args.TempFile)
+		c.pushToQueue(args.FilePair, true)
+	} else {
+		c.pushToReduceQueue(args.RObj, true)
+		reply.Done = c.rScheduluer.Done()
+	}
+}
+
 func (c *Coordinator) DecidePhase(args *WorkerArgs, reply *CoordinatorReply) int {
-	mapPhase, intermediatePhase, reducePhase, idle := 0, 1, 2, 3
 	phase := mapPhase
-	fmt.Printf("c.mScheduluer.CompleteTaskDispatch(args) : %v\n", c.mScheduluer.CompleteTaskDispatch(reply))
-	fmt.Printf("c.mScheduluer.Done() : %v\n", c.mScheduluer.Done())
 	if !c.mScheduluer.Done() {
-		popFromQueue(&c.mapFilePairs, reply)
+		c.popFromQueue(reply)
 		return c.mScheduluer.GetCurrentPhase(reply)
 	}
-	fmt.Printf("c.CompleteIntermediate : %v\n", c.CompleteIntermediate())
-	fmt.Printf("c.RunningIntermediate : %v\n", c.RunningIntermediate())
 	phase = intermediatePhase
 	if !c.CompleteIntermediate() {
 		if c.RunningIntermediate() {
@@ -187,10 +194,8 @@ func (c *Coordinator) DecidePhase(args *WorkerArgs, reply *CoordinatorReply) int
 		return phase
 	}
 	phase = reducePhase
-	fmt.Printf("c.rScheduluer.CompleteTaskDispatch(args) : %v\n", c.rScheduluer.CompleteTaskDispatch(reply))
-	fmt.Printf("c.rScheduluer.Done() : %v\n", c.rScheduluer.Done())
 	if !c.rScheduluer.Done() {
-		popFromReduceQueue(&c.reduceObjPairs, reply)
+		c.popFromReduceQueue(reply)
 		return c.rScheduluer.GetCurrentPhase(reply)
 	}
 	phase = idle
@@ -199,107 +204,36 @@ func (c *Coordinator) DecidePhase(args *WorkerArgs, reply *CoordinatorReply) int
 
 func (c *Coordinator) DispatchTask(args *WorkerArgs, reply *CoordinatorReply) error {
 	// Variables for phase change
-	// intermediatePhase, reducePhase := 1, 2
-	// running, complete := 2, 4
+	running, complete := 2, 4
 
-	fmt.Printf("[Coordinator] Before decide phase : %v, reply.Done: %v, with pid : %v\n", args.Phase, args, args.Pid)
+	c.mu.Lock()
+	phase := c.DecidePhase(args, reply)
+	reply.Phase = phase
+	c.phase = phase
+	c.mu.Unlock()
 
-	// c.mu.Lock()
-	// args.Phase = c.DecidePhase(args, reply)
-	// fmt.Printf("[Coordinatorc in DispatchTask] Current arge : %v, reply: %v, with pid : %v\n\n\n", args, reply, args.Pid)
-	// reply.Phase = args.Phase
-	// c.phase = reply.Phase
-	// c.mu.Unlock()
-
-	// if reply.Phase == intermediatePhase {
-	// 	// // fmt.Printf("coord is run intermediate, pid : %v\n", args.Pid)
-	// 	c.SetIntermediateStatus(running)
-	// 	c.RunIntermediatePhase()
-	// 	c.InitScheduler(reducePhase)
-	// 	c.SetIntermediateStatus(complete)
-	// }
-
-	return nil
-
-	// ch := make(chan bool)
-	// ticker := time.After(10 * time.Second)
-
-	// // Variables for phase change
-	// mapPhase, reducePhase := 0, 2
-
-	// switch phase := reply.Phase; phase {
-	// case mapPhase:
-	// 	go func() {
-	// 		ch <- args.Worker.ExecMap(args, reply)
-	// 	}()
-	// case reducePhase:
-	// 	go func() {
-	// 		ch <- args.Worker.ExecReduce(args, reply)
-	// 	}()
-	// }
-
-	// for {
-	// 	select {
-	// 	case completeTask := <-ch: // Work in time.
-	// 		reply.Done = completeTask
-	// 		c.ReceiveTaskExecResult(args, reply)
-	// 		return nil
-
-	// 	case <-ticker:
-	// 		// reply.Done = false
-	// 		reply.Done = false
-	// 		c.ReceiveTaskExecResult(args, reply)
-	// 		return nil
-	// 	}
-	// }
-}
-func (c *Coordinator) ReceiveTaskExecResult(args *WorkerArgs, reply *CoordinatorReply) error {
-	// // fmt.Printf("[Coordinator in ReportTaskExecResult]  with reply : %v, args: %v, with pid : %v\n", reply, args, args.Pid)
-	mapPhase, reducePhase := 0, 2
-	if reply.Done {
-		if reply.Phase == mapPhase {
-			c.IncreaseSchedulerTaskCnt(&c.mScheduluer, args)
-			fmt.Printf("Nicly done map, id : %v, file: %v, c.tmpFiles: %v,  cnt : %v\n\n\n", args.Pid, args.File, c.tmpFiles, c.mScheduluer.taskCnt)
-		} else if reply.Phase == reducePhase {
-			c.IncreaseSchedulerTaskCnt(&c.rScheduluer, args)
-			fmt.Printf("Nicly done reduce, id : %v, file: %v, reply: %v, cnt : %v\n\n\n", args.Pid, args.File, reply, c.rScheduluer.taskCnt)
-		}
-	} else {
-		if reply.Phase == mapPhase {
-			c.pushToQueue(&c.mapFilePairs, reply.FilePair)
-			fmt.Printf("Not done map, baddddddd, id : %v, file: %v\n\n\n", args.Pid, args.File)
-		} else if reply.Phase == reducePhase {
-			c.pushToReduceQueue(&c.reduceObjPairs, reply.RObj)
-			fmt.Printf("Not done reduce, baddddddd, id : %v, file: %v\n\n\n", args.Pid, args.File)
-		}
+	if reply.Phase == intermediatePhase {
+		c.SetIntermediateStatus(running)
+		c.RunIntermediatePhase()
+		c.InitScheduler(reducePhase)
+		c.SetIntermediateStatus(complete)
 	}
-	// success => counter ++
-	// else => push back to other
+
 	return nil
 }
 
-func (c *Coordinator) ReceiveTaskExecResult1(args *WorkerArgs, reply *CoordinatorReply) error {
-	// // fmt.Printf("[Coordinator in ReportTaskExecResult]  with reply : %v, args: %v, with pid : %v\n", reply, args, args.Pid)
-	mapPhase, reducePhase := 0, 2
+func (c *Coordinator) ReceiveTaskExecResult(args *WorkerArgs, reply *CoordinatorReply) error {
 	if args.Done {
 		if args.Phase == mapPhase {
-			c.IncreaseSchedulerTaskCnt(&c.mScheduluer, args)
-			fmt.Printf("Nicly done map, id : %v, file: %v, c.tmpFiles: %v,  cnt : %v\n\n\n", args.Pid, args.File, c.tmpFiles, c.mScheduluer.taskCnt)
+			c.mu.Lock()
+			c.IncreaseSchedulerTaskCnt(&c.mScheduluer, args, reply)
+			c.mu.Unlock()
 		} else if args.Phase == reducePhase {
-			c.IncreaseSchedulerTaskCnt(&c.rScheduluer, args)
-			fmt.Printf("Nicly done reduce, id : %v, file: %v, reply: %v, cnt : %v\n\n\n", args.Pid, args.File, reply, c.rScheduluer.taskCnt)
-		}
-	} else {
-		if args.Phase == mapPhase {
-			c.pushToQueue(&c.mapFilePairs, reply.FilePair)
-			fmt.Printf("Not done map, baddddddd, id : %v, file: %v\n\n\n", args.Pid, args.File)
-		} else if args.Phase == reducePhase {
-			c.pushToReduceQueue(&c.reduceObjPairs, reply.RObj)
-			fmt.Printf("Not done reduce, baddddddd, id : %v, file: %v\n\n\n", args.Pid, args.File)
+			c.mu.Lock()
+			c.IncreaseSchedulerTaskCnt(&c.rScheduluer, args, reply)
+			c.mu.Unlock()
 		}
 	}
-	// success => counter ++
-	// else => push back to other
 	return nil
 }
 
@@ -326,20 +260,59 @@ func (c *Coordinator) Done() bool {
 		isDone = c.rScheduluer.Done()
 	}
 	c.mu.Unlock()
-	fmt.Print("Hi done func \n")
 	return isDone
+}
+
+func (c *Coordinator) taskTracker() {
+	for {
+		select {
+		case task := <-c.mapCh:
+			timer := time.NewTimer(taskCrashTime * time.Second)
+			go func() {
+				<-timer.C
+				c.mu.Lock()
+				if _, ok := c.finishMapFilePairsMap[task.Key]; !ok {
+					c.pushToQueue(task, false)
+					c.mapFilePairsKeys = append(c.mapFilePairsKeys, task.Key)
+				}
+				c.mu.Unlock()
+			}()
+		case task := <-c.reduceCh:
+			timer := time.NewTimer(taskCrashTime * time.Second)
+			go func() {
+				<-timer.C
+				c.mu.Lock()
+				if _, ok := c.finishReduceObjPairsMap[task.Key]; !ok {
+					c.pushToReduceQueue(task, false)
+					c.reduceObjPairsKeys = append(c.reduceObjPairsKeys, task.Key)
+				}
+				c.mu.Unlock()
+			}()
+		}
+	}
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-	c.mapFilePairs = c.MakeFilePairs(files)
-	c.mScheduluer = Scheduluer{}
-	c.rScheduluer = Scheduluer{}
-	c.InitScheduler(0)
+	// init Coordinator
+	c := Coordinator{
+		mScheduluer:             Scheduluer{},
+		rScheduluer:             Scheduluer{},
+		mapCh:                   make(chan KeyValue, 100),
+		reduceCh:                make(chan ReduceObj, 100),
+		mapFilePairsMap:         make(map[string]KeyValue),
+		reduceObjPairsMap:       make(map[string]ReduceObj),
+		finishMapFilePairsMap:   make(map[string]KeyValue),
+		finishReduceObjPairsMap: make(map[string]ReduceObj),
+	}
+	c.MakeFilePairs(files)
+	c.InitScheduler(mapPhase)
 	c.rScheduluer.totalTaskCnt = -1
+
+	// start listening
+	go c.taskTracker()
 	c.server()
 	return &c
 }

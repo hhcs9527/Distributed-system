@@ -16,15 +16,10 @@ type Scheduluer struct {
 
 func (s *Scheduluer) CompleteTaskDispatch(reply *CoordinatorReply) bool {
 	s.mu.Lock()
-	// // // fmt.Printf("checking reply : %v\n", reply.Phase)
 	completeDispatch := false
 	if s.phase == mapPhase {
-		// // fmt.Printf("checking map phase.., *s.queue : %v\n", *s.queue)
-		// // fmt.Printf("checking map phase..,w len(*s.queue) : %v, reply.FilePair : %v\n", len(*s.queue), reply.FilePair)
 		completeDispatch = len(*s.queue) == 0 && reply.FilePair.Value == ""
 	} else {
-		// // // fmt.Printf("checking reducewc phase.., *s.reduceQueue : %v\n", *s.reduceQueue)
-		// // fmt.Printf("checking map reduce.., len(*s.reduceQueue) : %v, reply.RObj.Key : %v\n", len(*s.reduceQueue), reply.RObj.Key)
 		completeDispatch = len(*s.reduceQueue) == 0 && reply.RObj.Key == ""
 	}
 	s.mu.Unlock()
